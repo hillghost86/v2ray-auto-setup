@@ -107,8 +107,16 @@ stack_running() { [[ -n "$(docker ps -q --filter name='^caddy$' 2>/dev/null)" ]]
 # ---------------------------------------------------------------------------
 # 环境准备
 # ---------------------------------------------------------------------------
+# 所有子命令都要 root：配置在 /root/v2ray-stack 下（.env 是 600，里面的 UUID
+# 等同密码），Docker、apt、systemd、80/443 端口也都要。放在 main() 里统一拦，
+# 比在各个子命令里分别调更难漏——尤其是无参数进菜单时，menu() 第一行就是
+# load_env，非 root 下有可能连报错都来不及打就被 set -e 终止
+need_root() {
+  [[ $EUID -eq 0 ]] || die "需要 root 运行。配置在 /root/v2ray-stack 下，普通用户读不到。
+  请用: sudo -i 切到 root，或 curl -fsSL <脚本地址> | sudo bash -s -- ${1:-install}"
+}
+
 preflight() {
-  [[ $EUID -eq 0 ]] || die "请先执行 sudo -i 切换到 root 再运行"
   command -v apt-get >/dev/null || die "目前只支持 Debian / Ubuntu"
   command -v systemctl >/dev/null || die "需要 systemd"
 }
@@ -626,13 +634,15 @@ menu() {
 }
 
 main() {
+  # 每个有效子命令都先过 need_root。未知命令不用拦——那只是提示用法，
+  # 非 root 也该看到「未知命令」而不是「需要 root」
   case "${1:-}" in
-    install)   cmd_install ;;
-    update)    cmd_update ;;
-    status)    cmd_status ;;
-    show)      cmd_show "${2:-auto}" ;;
-    uninstall) cmd_uninstall ;;
-    "")        menu ;;
+    install)   need_root install;   cmd_install ;;
+    update)    need_root update;    cmd_update ;;
+    status)    need_root status;    cmd_status ;;
+    show)      need_root show;      cmd_show "${2:-auto}" ;;
+    uninstall) need_root uninstall; cmd_uninstall ;;
+    "")        need_root;           menu ;;
     *)         die "未知命令: $1（可用: install update status show uninstall）" ;;
   esac
 }
