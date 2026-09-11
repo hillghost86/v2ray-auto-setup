@@ -69,7 +69,11 @@ cleanup() {
   ((${#TMP_DIRS[@]})) && rm -rf "${TMP_DIRS[@]}"
   return 0
 }
-trap cleanup EXIT INT TERM
+# 只把 cleanup 挂在 EXIT 上。INT / TERM 若直接调 cleanup，处理完会从被打断的
+# 地方继续往下跑——按了 Ctrl-C 却照样把安装做完。改成主动 exit，由 EXIT 统一清理
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 mktmp() { local d; d=$(mktemp -d); TMP_DIRS+=("$d"); printf '%s' "$d"; }
 
