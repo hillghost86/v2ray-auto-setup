@@ -446,7 +446,7 @@ wait_ready() {
 # 子命令
 # ---------------------------------------------------------------------------
 cmd_show() {
-  local mode=${1:-auto} cols need
+  local mode=${1:-auto} cols need ec ec_ok=""
   load_env
   [[ -n $DOMAIN ]] || die "还没有安装，请先运行「安装」"
   step "客户端配置"
@@ -466,23 +466,24 @@ EOF
   vmess_link; echo
   [[ $mode == plain ]] && return 0
   command -v qrencode >/dev/null || return 0
-  # 纠错等级用 M（容错 15%，默认 L 只有 7%）。终端渲染半块字符偶尔会有
-  # 个别行发虚或错位，多出来的冗余正好兜住，代价只是宽度多 4 列左右
-  local qr_ec=M
-  # 二维码宽度取决于链接长度，不能写死 80 列。ASCII 输出每个模块占 2 列，
-  # ANSIUTF8 占 1 列，所以真正需要的列数是 ASCII 宽度的一半。宽度不够时折行，
-  # 图案会彻底错乱，不如直接跳过
-  need=$(vmess_link | qrencode -l "$qr_ec" -t ASCII 2>/dev/null \
-    | awk '{ if (length($0) > m) m = length($0) } END { print int(m / 2) }' || true)
-  [[ ${need:-0} -gt 0 ]] || need=80   # 量不出来就退回原来的固定阈值，别把二维码整个吞掉
+  # 纠错等级自适应：优先 M（容错 15%，能兜住终端渲染时个别行的错位），
+  # 终端装不下就退回 L（7%，二维码小 8 列左右）。宽度按真实尺寸算，不能写死
+  # 80 列——ASCII 输出每模块占 2 列，ANSIUTF8 占 1 列，所以需要的列数是前者的一半
   cols=$(tput cols 2>/dev/null || echo 80)
-  if (( cols < need )); then
-    ylw "二维码需要 $need 列，当前终端 $cols 列，已跳过。拉宽窗口后运行「显示链接」即可"
+  for ec in M L; do
+    need=$(vmess_link | qrencode -l "$ec" -t ASCII 2>/dev/null \
+      | awk '{ if (length($0) > m) m = length($0) } END { print int(m / 2) }' || true)
+    need=${need:-0}
+    (( need == 0 )) && { ec_ok=L; break; }   # 量不出来就照旧画，别把二维码整个吞掉
+    (( cols >= need )) && { ec_ok=$ec; break; }
+  done
+  if [[ -z $ec_ok ]]; then
+    ylw "二维码至少需要 $need 列，当前终端 $cols 列，已跳过。拉宽窗口后运行「显示链接」即可"
     return 0
   fi
   echo
   echo "Shadowrocket 扫码导入（显示错乱时可只用上面的链接）："
-  vmess_link | qrencode -l "$qr_ec" -t ANSIUTF8
+  vmess_link | qrencode -l "$ec_ok" -t ANSIUTF8
 }
 
 cmd_install() {
