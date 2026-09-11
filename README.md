@@ -74,10 +74,21 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v
 
 安装时把 CDN 选 `yes`，并在 Cloudflare 侧：
 
+- 域名必须是**一级子域**，例如 `aws.example.com`。见下方说明
 - 云朵改成**橙色**（已代理）
 - SSL/TLS 模式选**完全（严格）**
 - 网络里 **WebSockets 保持开启**
 - **不要**开启「始终使用 HTTPS」（会挡住证书申请）
+
+> **多级子域用不了。** Cloudflare 免费版 Universal SSL 只签 `example.com` 和 `*.example.com`，通配符不覆盖 `aws.no2.example.com` 这种多级子域。橙色云朵下客户端连的是 Cloudflare 边缘，边缘拿不出证书，直接回一个握手失败。
+>
+> 迷惑之处在于**源站一切正常**：Let's Encrypt 不限子域层级，证书照发，服务器上怎么测都是绿的，偏偏客户端连不上。判断方法：
+>
+> ```bash
+> echo | openssl s_client -connect 你的域名:443 -servername 你的域名 2>&1 | head -5
+> ```
+>
+> 出现 `no peer certificate available` 就是这个问题。解决办法：换一级子域（推荐）、把云朵改灰（同时把脚本的 CDN 选项改成 `no`），或购买 Advanced Certificate Manager 开启 Total TLS。
 
 ## 脚本做了哪些检查
 
@@ -86,6 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v
 1. **装之前查域名**：临时在 80 端口起一个网页服务，再从外网经域名访问它。一次性验证 DNS 解析、云厂商防火墙、CDN 转发三件事，比 `ping` 靠谱。顺带检查 AAAA 记录是否指向别处。
 2. **装之后查握手**：模拟一次 WebSocket 升级请求，返回 101 才算 Caddy → V2Ray 链路通、证书有效。
 3. **最后查真连通**：起一个临时 V2Ray 客户端容器，用刚生成的 UUID 真的走一遍代理去访问外网。这一步过了，说明 UUID、路径、TLS 全都对，而不只是端口开着。
+4. **CDN 模式下还要查边缘**：上面几项为了排除干扰都绕开了 Cloudflare，所以照不出边缘的毛病。开了 CDN 时会按域名真实解析再走一遍，也就是客户端实际走的那条路。
 
 任何一步没过都会打印对应容器的日志和排查方向。`update` 也走同一套自检，新版本不过就问你要不要回退——回退用的是更新前那个镜像，所以确认没问题之前旧镜像不会被删。
 

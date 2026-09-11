@@ -391,6 +391,24 @@ EOF
   [[ ${code:-} == 204 ]]
 }
 
+# 三、CDN 边缘：上面两项都刻意绕开了 Cloudflare（ws_ok 用 --resolve 打本机，
+#    e2e_ok 走 Docker 内网直连 caddy），源站再正常也照不出边缘的毛病。
+#    这里按域名真实解析走一遍，客户端实际走的就是这条路。
+cdn_ok() {
+  curl -s -o /dev/null --max-time 10 "https://$DOMAIN/" 2>/dev/null
+}
+
+cdn_hint() {
+  red "✗ 经 Cloudflare 访问失败，但源站是好的——问题在 CDN 这一跳"
+  echo "  最常见原因：免费版 Universal SSL 只签 example.com 和 *.example.com，"
+  echo "  通配符不覆盖 a.b.example.com 这种多级子域，边缘拿不出证书就直接握手失败。"
+  echo "  自查: echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN 2>&1 | head -5"
+  echo "        出现 no peer certificate available 即是此问题"
+  echo "  解决: 1) 换成一级子域（推荐，如 xxx.example.com）"
+  echo "        2) 云朵改灰（仅 DNS），同时把本脚本的 CDN 选项改成 no"
+  echo "        3) 购买 Advanced Certificate Manager 开启 Total TLS"
+}
+
 wait_ready() {
   step "等待证书申请和服务启动（最多 3 分钟）"
   local ok=no
@@ -409,7 +427,14 @@ wait_ready() {
   step "真实连接测试（用当前 UUID 走一遍代理）"
   if e2e_ok; then
     grn "✓ 代理连通，UUID、路径、TLS 均正确"
-    return 0
+    [[ $CDN != yes ]] && return 0
+    step "经 Cloudflare 边缘测试（客户端实际走的路径）"
+    if cdn_ok; then
+      grn "✓ 通过 Cloudflare 也能正常访问"
+      return 0
+    fi
+    cdn_hint
+    return 1
   fi
   red "✗ 代理连不通。端口和证书没问题，多半是 UUID 或路径没生效"
   echo "  V2Ray 日志："
@@ -544,6 +569,9 @@ cmd_status() {
   step "链路自检"
   if ws_ok; then grn "✓ 证书和 WebSocket 正常"; else red "✗ WebSocket 握手失败: docker logs --tail 50 caddy"; fi
   if e2e_ok; then grn "✓ 代理连通"; else red "✗ 代理连不通: docker logs --tail 50 v2ray"; fi
+  if [[ $CDN == yes ]]; then
+    if cdn_ok; then grn "✓ 经 Cloudflare 边缘访问正常"; else cdn_hint; fi
+  fi
 }
 
 cmd_uninstall() {
