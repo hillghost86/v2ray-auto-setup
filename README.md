@@ -14,11 +14,19 @@ Docker、Docker Compose、qrencode 这些依赖脚本会自己装。
 
 ## 使用
 
-以 root 运行：
+所有子命令都要 root（配置在 `/root/v2ray-stack` 下，还要动 Docker、apt、systemd 和 80/443 端口）。先 `sudo -i` 切到 root，然后：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v2ray.sh)
 ```
+
+不想切 root 就用管道加 `sudo`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v2ray.sh | sudo bash -s -- install
+```
+
+> 唯独 `sudo bash <(curl ...)` **不能用**。进程替换的 `/dev/fd/63` 是调用者进程的管道，而 sudo 默认 `closefrom=3` 会关掉 3 号以上所有文件描述符，新进程再去打开它只会得到 `No such file or directory`。要么用上面的管道写法，要么下载到本地再 `sudo bash v2ray.sh`。
 
 不带参数会进菜单：
 
@@ -32,11 +40,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup
  0) 退出
 ```
 
-也可以直接指定子命令：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v2ray.sh | bash -s -- install
-```
+也可以直接指定子命令（把 `install` 换成下表里任意一个）：
 
 | 子命令 | 作用 |
 | --- | --- |
@@ -55,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v
 
 ## 装完之后
 
-脚本会直接输出可粘贴的 `vmess://` 链接（v2rayN、Shadowrocket 等通用），以及扫码用的二维码（终端宽度需 ≥ 80 列）。手动填的话：
+脚本会直接输出可粘贴的 `vmess://` 链接（v2rayN、Shadowrocket 等通用），以及扫码用的二维码。二维码的宽度取决于链接长度，脚本会按实际尺寸和终端宽度挑纠错等级（优先 M，装不下退 L），实在放不下就跳过并告诉你还差几列。手动填的话：
 
 | 项 | 值 |
 | --- | --- |
@@ -122,9 +126,11 @@ docker volume caddy_config       Caddy 运行时配置
 ss -tlnp | grep ':80 '
 ```
 
-**服务起来了但连不上** — 跑一次「查看运行状态」，它会分别告诉你是证书/握手的问题还是 UUID/路径的问题。
+**服务起来了但连不上** — 跑一次「查看运行状态」，三项自检会分别指出是证书/握手、UUID/路径，还是 Cloudflare 边缘的问题。特别注意「源站全绿但客户端连不上」这种情况，多半是上面说的多级子域。
 
-**在 Windows 上编辑过脚本** — 脚本开头自带 CRLF 自愈，会去掉 `\r` 再重新执行自己，不用手动 `dos2unix`。
+**提示需要 root** — 所有子命令都要 root，包括只读的 `status` 和 `show`（配置在 `/root/v2ray-stack` 下，`.env` 是 600）。用法见上面「使用」一节。
+
+**在 Windows 上编辑过脚本** — 脚本开头自带 CRLF 自愈，是磁盘上的普通文件时会去掉 `\r` 再重新执行自己，不用手动 `dos2unix`。通过管道运行时不做这个检查（那种情况下也不会有 CRLF），否则读取自身会把数据从管道里抢走、导致脚本被截断。
 
 **看日志**：
 
