@@ -446,7 +446,7 @@ wait_ready() {
 # 子命令
 # ---------------------------------------------------------------------------
 cmd_show() {
-  local mode=${1:-auto} cols
+  local mode=${1:-auto} cols need
   load_env
   [[ -n $DOMAIN ]] || die "还没有安装，请先运行「安装」"
   step "客户端配置"
@@ -466,9 +466,15 @@ EOF
   vmess_link; echo
   [[ $mode == plain ]] && return 0
   command -v qrencode >/dev/null || return 0
+  # 二维码宽度取决于链接长度，不能写死 80 列。ASCII 输出每个模块占 2 列，
+  # ANSIUTF8 占 1 列，所以真正需要的列数是 ASCII 宽度的一半。宽度不够时折行，
+  # 图案会彻底错乱，不如直接跳过
+  need=$(vmess_link | qrencode -t ASCII 2>/dev/null \
+    | awk '{ if (length($0) > m) m = length($0) } END { print int(m / 2) }' || true)
+  [[ ${need:-0} -gt 0 ]] || need=80   # 量不出来就退回原来的固定阈值，别把二维码整个吞掉
   cols=$(tput cols 2>/dev/null || echo 80)
-  if (( cols < 80 )); then
-    ylw "终端宽度不足 80 列，跳过二维码。想看二维码请把窗口拉宽后再运行「显示链接」"
+  if (( cols < need )); then
+    ylw "二维码需要 $need 列，当前终端 $cols 列，已跳过。拉宽窗口后运行「显示链接」即可"
     return 0
   fi
   echo
