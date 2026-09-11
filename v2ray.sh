@@ -12,9 +12,11 @@
 #   /root/v2ray-stack/compose.yaml  容器定义（V2Ray 与 Caddy 配置内嵌其中）
 #   Docker 数据卷 caddy_data         HTTPS 证书
 # =============================================================================
-# 换行符自愈：Windows 格式（CRLF）会让脚本无法运行，这里自动去掉 \r 后重新执行
+# 换行符自愈：Windows 格式（CRLF）会让脚本无法运行，这里自动去掉 \r 后重新执行。
+# 必须先确认脚本是磁盘上的普通文件：通过 bash <(curl ...) 运行时脚本来自管道，
+# 再去读它会把数据从 bash 自己手里抢走，导致脚本被截断（管道场景也不会有 CRLF）。
 # 下面这行必须保持单行，行尾注释用来兜住可能存在的 \r
-if head -1 "${BASH_SOURCE[0]:-$0}" 2>/dev/null | grep -q $'\r'; then _f=$(mktemp); sed 's/\r$//' "${BASH_SOURCE[0]:-$0}" > "$_f"; exec bash "$_f" "$@"; fi # crlf-guard
+_s=${BASH_SOURCE[0]:-$0}; if [[ -f $_s ]] && IFS= read -r _l < "$_s" 2>/dev/null && [[ $_l == *$'\r' ]]; then _f=$(mktemp); sed 's/\r$//' "$_s" > "$_f"; exec bash "$_f" "$@"; fi; unset -v _s _l # crlf-guard
 
 set -euo pipefail
 
@@ -55,6 +57,9 @@ CADDY_STOPPED=no
 TMP_DIRS=()
 
 cleanup() {
+  # 清理不能因为某一步失败就中断：docker rm 在容器本来就不存在时会返回非 0，
+  # 若保留 set -e，后面「恢复 Caddy」就被跳过了，服务会一直停着
+  set +e
   [[ -n $CHECK_PID ]] && kill "$CHECK_PID" 2>/dev/null
   docker rm -f v2ray-e2e >/dev/null 2>&1
   if [[ $CADDY_STOPPED == yes ]]; then
