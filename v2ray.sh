@@ -335,11 +335,14 @@ vmess_link() {
 # 自检
 # ---------------------------------------------------------------------------
 # 一、证书与 WebSocket：本机模拟一次握手，返回 101 说明 Caddy→V2Ray 链路正常
+# Sec-WebSocket-Key 必须是 16 字节随机值的 base64（RFC 6455），V2Ray 用的
+# gorilla/websocket 会校验解码后的长度，不是 16 字节一律回 400。下面用的是
+# RFC 里的示例值（解码为 the sample nonce，正好 16 字节）。
 ws_ok() {
   curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 5 \
     --resolve "$DOMAIN:443:127.0.0.1" \
     -H "Connection: Upgrade" -H "Upgrade: websocket" \
-    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" \
+    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
     "https://$DOMAIN$WS_PATH" 2>/dev/null | grep -q '^101$'
 }
 
@@ -470,7 +473,16 @@ cmd_install() {
   # 会导致新 UUID / 路径不生效，所以这里强制重建
   compose up -d --force-recreate --remove-orphans
   CADDY_STOPPED=no
-  wait_ready || die "安装未完成，排查后可重新运行本脚本"
+
+  # 自检没过也要把配置打出来：容器此时已经在跑，链接可能本来就是能用的，
+  # 直接 die 掉等于让人白装一场
+  if ! wait_ready; then
+    echo
+    ylw "自检未通过，但容器已经启动。下面是当前配置，可先自行验证；"
+    ylw "排查后重新运行本脚本即可，也可以用「查看运行状态」再测一次。"
+    cmd_show
+    exit 1
+  fi
 
   cmd_show
   echo
