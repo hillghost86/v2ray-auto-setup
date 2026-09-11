@@ -466,10 +466,13 @@ EOF
   vmess_link; echo
   [[ $mode == plain ]] && return 0
   command -v qrencode >/dev/null || return 0
+  # 纠错等级用 M（容错 15%，默认 L 只有 7%）。终端渲染半块字符偶尔会有
+  # 个别行发虚或错位，多出来的冗余正好兜住，代价只是宽度多 4 列左右
+  local qr_ec=M
   # 二维码宽度取决于链接长度，不能写死 80 列。ASCII 输出每个模块占 2 列，
   # ANSIUTF8 占 1 列，所以真正需要的列数是 ASCII 宽度的一半。宽度不够时折行，
   # 图案会彻底错乱，不如直接跳过
-  need=$(vmess_link | qrencode -t ASCII 2>/dev/null \
+  need=$(vmess_link | qrencode -l "$qr_ec" -t ASCII 2>/dev/null \
     | awk '{ if (length($0) > m) m = length($0) } END { print int(m / 2) }' || true)
   [[ ${need:-0} -gt 0 ]] || need=80   # 量不出来就退回原来的固定阈值，别把二维码整个吞掉
   cols=$(tput cols 2>/dev/null || echo 80)
@@ -479,7 +482,7 @@ EOF
   fi
   echo
   echo "Shadowrocket 扫码导入（显示错乱时可只用上面的链接）："
-  vmess_link | qrencode -t ANSIUTF8
+  vmess_link | qrencode -l "$qr_ec" -t ANSIUTF8
 }
 
 cmd_install() {
