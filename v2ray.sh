@@ -338,12 +338,16 @@ vmess_link() {
 # Sec-WebSocket-Key 必须是 16 字节随机值的 base64（RFC 6455），V2Ray 用的
 # gorilla/websocket 会校验解码后的长度，不是 16 字节一律回 400。下面用的是
 # RFC 里的示例值（解码为 the sample nonce，正好 16 字节）。
+# 不能用管道接 grep：握手成功后 curl 会一直等着读隧道数据，直到 --max-time
+# 超时并以 28 退出，而脚本开了 pipefail，管道整体就成了失败——越成功越判失败。
 ws_ok() {
-  curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 5 \
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 5 \
     --resolve "$DOMAIN:443:127.0.0.1" \
     -H "Connection: Upgrade" -H "Upgrade: websocket" \
     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-    "https://$DOMAIN$WS_PATH" 2>/dev/null | grep -q '^101$'
+    "https://$DOMAIN$WS_PATH" 2>/dev/null) || true
+  [[ ${code//[[:space:]]/} == 101 ]]
 }
 
 # 二、真实连接：启动一个临时 V2Ray 客户端，用当前 UUID 走一遍代理访问外网
