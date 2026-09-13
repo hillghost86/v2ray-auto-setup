@@ -517,7 +517,9 @@ EOF
 CDN_CODE="" CDN_ERR=""
 cdn_ok() {
   local out
-  out=$(curl -sS -o /dev/null -w '\n%{http_code}' --http1.1 --max-time 15 \
+  # 超时要给够：Cloudflare 回源连不上要等 15 秒以上才回 522，超时比它短就只能
+  # 拿到 000，把「云防火墙没开 443」误判成证书或出网问题
+  out=$(curl -sS -o /dev/null -w '\n%{http_code}' --http1.1 --max-time 35 \
     -H "Connection: Upgrade" -H "Upgrade: websocket" \
     -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
     "https://$DOMAIN$WS_PATH" 2>&1) || true
@@ -534,9 +536,18 @@ cdn_hint() {
   red "✗ 经 Cloudflare 握手失败，但源站是好的——问题在 CDN 这一跳"
   case ${CDN_CODE:-000} in
     000)
-      echo "  连接或 TLS 层就失败了，curl 的原话：${CDN_ERR:-（无）}"
+      echo "  没拿到 HTTP 响应，curl 的原话：${CDN_ERR:-（无）}"
       dots=$(tr -cd '.' <<<"$DOMAIN" | wc -c)
-      if (( dots >= 3 )); then
+      if [[ $CDN_ERR == *"(28)"* ]]; then
+        # TLS 已完成、请求发出后一直没回应：边缘收到了请求，卡在回源。
+        # 前面的自检打 127.0.0.1 和 Docker 网桥，都不经过云厂商防火墙，所以是绿的
+        echo "  请求发出后一直没有回应：Cloudflare 边缘收到了请求，但连不上你的源站 443。"
+        echo "  前面几项自检走的是本机回环和 Docker 网桥，不经过云厂商防火墙，所以照不出这个问题。"
+        echo "  1) 云厂商防火墙（Lightsail 控制台里的 Networking / 安全组）是否对所有来源放行 TCP 443，"
+        echo "     系统里的 ufw 和它是两回事"
+        echo "  2) Cloudflare 里如果还有指向本机的 AAAA 记录，IPv6 防火墙也要放行 443，或删掉该记录"
+        echo "  3) 宝塔「安全」页的端口规则是否放行 443"
+      elif (( dots >= 3 )); then
         echo "  域名看起来是多级子域。免费版 Universal SSL 只签 example.com 和 *.example.com，"
         echo "  通配符不覆盖 a.b.example.com，边缘拿不出证书就直接握手失败。"
         echo "  解决: 1) 换成一级子域（推荐，如 xxx.example.com）"
@@ -547,7 +558,7 @@ cdn_hint() {
         echo "  1) 域名刚加进 Cloudflare，Universal SSL 还在签发中（最长 24 小时）：SSL/TLS → 边缘证书 里看状态"
         echo "  2) 本机到 Cloudflare 的出网不通或超时：换台机器或手机流量访问 https://$DOMAIN 对比"
       fi
-      echo "  自查: curl -sSv -o /dev/null --max-time 15 https://$DOMAIN$WS_PATH 2>&1 | tail -20"
+      echo "  自查: curl -sSv -o /dev/null --max-time 60 https://$DOMAIN$WS_PATH 2>&1 | tail -20"
       ;;
     200|400|404|426)
       echo "  边缘返回 HTTP $CDN_CODE 而不是 101：请求没有被当作 WebSocket 升级转到 V2Ray。"
@@ -559,8 +570,9 @@ cdn_hint() {
       echo "  给路径 $WS_PATH 加一条 WAF 跳过规则，或关掉这些功能"
       ;;
     520|521|522|523|524)
-      echo "  边缘返回 HTTP $CDN_CODE：Cloudflare 连不上源站。"
-      echo "  检查云厂商防火墙是否对所有来源放行 TCP 443（不只是你自己的 IP），以及源站 443 是否在监听"
+      echo "  边缘返回 HTTP $CDN_CODE：Cloudflare 连不上源站。前面的自检走本机回环和 Docker 网桥，"
+      echo "  不经过云厂商防火墙，所以照不出来。检查 Lightsail 控制台 / 安全组是否对所有来源放行 TCP 443"
+      echo "  （系统里的 ufw 和它是两回事），Cloudflare 里有指向本机的 AAAA 记录的话 IPv6 防火墙同样要放行"
       ;;
     525|526)
       echo "  边缘返回 HTTP $CDN_CODE：Cloudflare 到源站的 TLS 失败。"
