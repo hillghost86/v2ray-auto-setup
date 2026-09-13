@@ -510,20 +510,70 @@ EOF
 
 # 三、CDN 边缘：上面两项都刻意绕开了 Cloudflare（ws_ok 用 --resolve 打本机，
 #    e2e_ok 走 Docker 内网直连 caddy），源站再正常也照不出边缘的毛病。
-#    这里按域名真实解析走一遍，客户端实际走的就是这条路。
+#    这里按域名真实解析做一次 WebSocket 握手，客户端实际走的就是这条路：
+#    既验边缘证书，也验 Cloudflare 的 WebSockets 开关和到源站的回程。
+#    不加 -f，也不把 stderr 扔掉：失败时状态码和 curl 的原话就是线索，
+#    以前只看成败、一律归咎于「多级子域」，一级子域撞上别的原因就把人带偏了。
+CDN_CODE="" CDN_ERR=""
 cdn_ok() {
-  curl -s -o /dev/null --max-time 10 "https://$DOMAIN/" 2>/dev/null
+  local out
+  out=$(curl -sS -o /dev/null -w '\n%{http_code}' --http1.1 --max-time 15 \
+    -H "Connection: Upgrade" -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+    "https://$DOMAIN$WS_PATH" 2>&1) || true
+  CDN_CODE=${out##*$'\n'}; CDN_CODE=${CDN_CODE//[[:space:]]/}
+  CDN_ERR=""
+  # stderr 可能有多行、末尾带换行，压成一行方便嵌进提示里
+  [[ $out == *$'\n'* ]] && CDN_ERR=$(printf '%s\n' "${out%$'\n'*}" | sed '/^[[:space:]]*$/d' | paste -sd ' ')
+  # 握手成功后 curl 会等隧道数据直到超时，stderr 会多一条 timeout，不算错
+  [[ $CDN_CODE == 101 ]]
 }
 
 cdn_hint() {
-  red "✗ 经 Cloudflare 访问失败，但源站是好的——问题在 CDN 这一跳"
-  echo "  最常见原因：免费版 Universal SSL 只签 example.com 和 *.example.com，"
-  echo "  通配符不覆盖 a.b.example.com 这种多级子域，边缘拿不出证书就直接握手失败。"
-  echo "  自查: echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN 2>&1 | head -5"
-  echo "        出现 no peer certificate available 即是此问题"
-  echo "  解决: 1) 换成一级子域（推荐，如 xxx.example.com）"
-  echo "        2) 云朵改灰（仅 DNS），同时把本脚本的 CDN 选项改成 no"
-  echo "        3) 购买 Advanced Certificate Manager 开启 Total TLS"
+  local dots
+  red "✗ 经 Cloudflare 握手失败，但源站是好的——问题在 CDN 这一跳"
+  case ${CDN_CODE:-000} in
+    000)
+      echo "  连接或 TLS 层就失败了，curl 的原话：${CDN_ERR:-（无）}"
+      dots=$(tr -cd '.' <<<"$DOMAIN" | wc -c)
+      if (( dots >= 3 )); then
+        echo "  域名看起来是多级子域。免费版 Universal SSL 只签 example.com 和 *.example.com，"
+        echo "  通配符不覆盖 a.b.example.com，边缘拿不出证书就直接握手失败。"
+        echo "  解决: 1) 换成一级子域（推荐，如 xxx.example.com）"
+        echo "        2) 云朵改灰（仅 DNS），同时把本脚本的 CDN 选项改成 no"
+        echo "        3) 购买 Advanced Certificate Manager 开启 Total TLS"
+      else
+        echo "  域名是一级子域，通配符证书应能覆盖。常见原因："
+        echo "  1) 域名刚加进 Cloudflare，Universal SSL 还在签发中（最长 24 小时）：SSL/TLS → 边缘证书 里看状态"
+        echo "  2) 本机到 Cloudflare 的出网不通或超时：换台机器或手机流量访问 https://$DOMAIN 对比"
+      fi
+      echo "  自查: curl -sSv -o /dev/null --max-time 15 https://$DOMAIN$WS_PATH 2>&1 | tail -20"
+      ;;
+    200|400|404|426)
+      echo "  边缘返回 HTTP $CDN_CODE 而不是 101：请求没有被当作 WebSocket 升级转到 V2Ray。"
+      echo "  1) Cloudflare 网络 → WebSockets 是否开启"
+      echo "  2) 路径 $WS_PATH 在源站是否真的转给了 V2Ray（本机 443 已通过，多半是 1）"
+      ;;
+    403|503)
+      echo "  边缘返回 HTTP $CDN_CODE：多半是 Cloudflare 的 WAF / Bot Fight Mode / Under Attack 模式拦下了。"
+      echo "  给路径 $WS_PATH 加一条 WAF 跳过规则，或关掉这些功能"
+      ;;
+    520|521|522|523|524)
+      echo "  边缘返回 HTTP $CDN_CODE：Cloudflare 连不上源站。"
+      echo "  检查云厂商防火墙是否对所有来源放行 TCP 443（不只是你自己的 IP），以及源站 443 是否在监听"
+      ;;
+    525|526)
+      echo "  边缘返回 HTTP $CDN_CODE：Cloudflare 到源站的 TLS 失败。"
+      echo "  SSL/TLS 模式选「完全（严格）」时源站证书必须有效且未过期，SNI 要能匹配 $DOMAIN"
+      ;;
+    530)
+      echo "  边缘返回 HTTP 530：源站侧 DNS / Tunnel 错误，看 Cloudflare 的错误页里的 1xxx 子码"
+      ;;
+    *)
+      echo "  边缘返回 HTTP $CDN_CODE${CDN_ERR:+，curl: $CDN_ERR}"
+      ;;
+  esac
+  echo "  排查后运行本脚本选「查看运行状态」即可重测"
 }
 
 # 等 fn 返回成功，最多 n 次，每次间隔 5 秒
@@ -577,7 +627,7 @@ wait_ready() {
     [[ $CDN != yes ]] && return 0
     step "经 Cloudflare 边缘测试（客户端实际走的路径）"
     if cdn_ok; then
-      grn "✓ 通过 Cloudflare 也能正常访问"
+      grn "✓ 经 Cloudflare 边缘握手成功，客户端走的这条路是通的"
       return 0
     fi
     cdn_hint
@@ -759,7 +809,7 @@ cmd_status() {
   fi
   if e2e_ok; then grn "✓ 代理连通"; else red "✗ 代理连不通: docker logs --tail 50 v2ray"; fi
   if [[ $CDN == yes ]]; then
-    if cdn_ok; then grn "✓ 经 Cloudflare 边缘访问正常"; else cdn_hint; fi
+    if cdn_ok; then grn "✓ 经 Cloudflare 边缘握手正常"; else cdn_hint; fi
   fi
 }
 
