@@ -4,6 +4,8 @@
 
 全部跑在 Docker 里，不往系统里装 V2Ray 或 Nginx，卸载干净。
 
+机器上已经有宝塔面板或别的 Nginx 占着 80 / 443 也能装：安装时选「已有 Nginx」模式，脚本只跑 V2Ray，证书和 443 交给 Nginx，见下方「[和宝塔面板共存](#和宝塔面板--已有-nginx-共存)」。
+
 ## 需要准备
 
 - 一台 Debian / Ubuntu 服务器（需要 systemd，root 权限）
@@ -50,12 +52,13 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v
 | `show` | 打印客户端配置、vmess 链接和二维码（`show plain` 不画二维码） |
 | `uninstall` | 删除容器，可选一并删除证书和配置目录 |
 
-安装时需要填 4 项，回车即用默认值：
+安装时需要填 5 项，回车即用默认值：
 
 - **域名** — 已解析到本机的那个
 - **UUID** — 回车随机生成
 - **WebSocket 路径** — 回车随机生成，例如 `/a1b2c3`
 - **是否走 Cloudflare CDN** — 决定域名检查时的排查提示
+- **HTTPS 由谁负责** — 默认脚本自带的 Caddy；机器上已有宝塔 / Nginx 占着 443 时选「已有 Nginx」（首次安装检测到 443 被占会自动把默认值切过去）
 
 ## 装完之后
 
@@ -94,6 +97,42 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v
 >
 > 出现 `no peer certificate available` 就是这个问题。解决办法：换一级子域（推荐）、把云朵改灰（同时把脚本的 CDN 选项改成 `no`），或购买 Advanced Certificate Manager 开启 Total TLS。
 
+## 和宝塔面板 / 已有 Nginx 共存
+
+Caddy 模式要独占 80 和 443，机器上装了宝塔面板（或任何 Nginx / Apache）就会撞端口。给 Caddy 换端口也绕不开：证书验证只认 80 和 443，而 Nginx 在前面七层反代的话自己就得有证书，Caddy 那张就白申请了。所以脚本干脆提供了另一种分工：
+
+| | Caddy 模式（默认） | 已有 Nginx 模式 |
+| --- | --- | --- |
+| 跑的容器 | v2ray + caddy | 只有 v2ray |
+| V2Ray 端口 | 仅容器内网 | `127.0.0.1:2333`，外网碰不到 |
+| 证书申请 / 续期 | Caddy 自动 | 宝塔面板 |
+| 443 上的反代 | Caddy | 你在站点配置里加一段 `location` |
+| 客户端配置 | 域名、443、TLS、路径 | 完全一样 |
+
+安装时「HTTPS 由谁负责」选 2，脚本启动 V2Ray 后会打印出要贴进宝塔的配置，照做即可：
+
+1. 宝塔里给这个域名**添加站点**（纯静态就行），**申请 SSL 证书**并部署。
+2. 打开站点的**配置文件**，在 443 的 `server` 块里加入（路径换成安装时生成的那个）：
+
+   ```nginx
+   location /a1b2c3 {
+       proxy_pass http://127.0.0.1:2333;
+       proxy_http_version 1.1;
+       proxy_set_header Upgrade $http_upgrade;
+       proxy_set_header Connection "upgrade";
+       proxy_set_header Host $host;
+       proxy_set_header X-Real-IP $remote_addr;
+       proxy_read_timeout 300s;
+   }
+   ```
+
+   不要用面板的「反向代理」功能整站反代，那会把根路径也转给 V2Ray。只加这一个 `location`，域名根路径照常显示站点内容，比 Caddy 那句 "It works!" 更不显眼。
+3. 保存重载后回到脚本按回车，自检会分两段：先直连 2333 确认 V2Ray 本身是好的，再经 443 走一遍 Nginx 确认证书和反代。哪段没过就知道该查哪边。
+
+这个模式下脚本**不做 80 端口的域名检查**（端口在 Nginx 手里，起不了临时服务），DNS 是否正确靠宝塔申请证书那一步验证。证书续期也归宝塔，`status` 里的证书有效期读的是 443 上宝塔部署的那张。
+
+已经装成 Caddy 模式的机器，重跑安装选 2 即可切换：`--remove-orphans` 会删掉 caddy 容器，证书卷保留。反过来从 Nginx 模式切回 Caddy，得先把 Nginx 从 80 / 443 上挪开。
+
 ## 脚本做了哪些检查
 
 这是它跟大多数一键脚本不一样的地方——不是启动完就宣布成功。
@@ -108,10 +147,10 @@ curl -fsSL https://raw.githubusercontent.com/hillghost86/v2ray-auto-setup/main/v
 ## 文件位置
 
 ```
-/root/v2ray-stack/.env           域名、UUID、路径、镜像版本（权限 600）
+/root/v2ray-stack/.env           域名、UUID、路径、前端模式、镜像版本（权限 600）
 /root/v2ray-stack/compose.yaml   容器定义，V2Ray 和 Caddy 的配置内嵌其中
-docker volume caddy_data         HTTPS 证书
-docker volume caddy_config       Caddy 运行时配置
+docker volume caddy_data         HTTPS 证书（仅 Caddy 模式）
+docker volume caddy_config       Caddy 运行时配置（仅 Caddy 模式）
 ```
 
 想改配置不用手动编辑这些文件，重跑脚本选「安装 / 修改配置」即可，原值会作为默认值带出来。
@@ -125,6 +164,10 @@ docker volume caddy_config       Caddy 运行时配置
 ```bash
 ss -tlnp | grep ':80 '
 ```
+
+占着的是宝塔 / Nginx 的话不用停它，重跑安装把「HTTPS 由谁负责」选成「已有 Nginx」，见上面「和宝塔面板共存」。
+
+**Nginx 模式下「经 443 握手失败」但「V2Ray 正常」** — 问题在 Nginx 这一跳：站点证书没申请或没部署、`location` 没加进 443 的 `server` 块、没重载，或者少了 `Upgrade` / `Connection` 头（那样会返回 200 或 400 而不是 101）。改完 `nginx -t && nginx -s reload`，再跑「查看运行状态」。
 
 **服务起来了但连不上** — 跑一次「查看运行状态」，三项自检会分别指出是证书/握手、UUID/路径，还是 Cloudflare 边缘的问题。特别注意「源站全绿但客户端连不上」这种情况，多半是上面说的多级子域。
 
