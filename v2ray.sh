@@ -7,10 +7,15 @@
 #   curl -fsSL .../v2ray.sh | bash -s -- install
 #   支持的子命令: install | update | status | show | uninstall
 #
+# 两种前端模式（安装时选择，存在 .env 的 FRONT 里）:
+#   caddy  脚本自带 Caddy 占 80/443，自动申请证书（默认）
+#   nginx  机器上已有 Nginx（宝塔面板等）占着 80/443：只跑 V2Ray，端口绑在
+#          127.0.0.1:2333，证书和 443 交给 Nginx，由用户在 Nginx 里反代过来
+#
 # 文件位置:
-#   /root/v2ray-stack/.env          域名、UUID、路径、镜像版本（脚本与 compose 共用）
+#   /root/v2ray-stack/.env          域名、UUID、路径、前端模式、镜像版本（脚本与 compose 共用）
 #   /root/v2ray-stack/compose.yaml  容器定义（V2Ray 与 Caddy 配置内嵌其中）
-#   Docker 数据卷 caddy_data         HTTPS 证书
+#   Docker 数据卷 caddy_data         HTTPS 证书（仅 caddy 模式）
 # =============================================================================
 # 换行符自愈：Windows 格式（CRLF）会让脚本无法运行，这里自动去掉 \r 后重新执行。
 # 必须先确认脚本是磁盘上的普通文件：通过 bash <(curl ...) 运行时脚本来自管道，
@@ -81,12 +86,14 @@ mktmp() { local d; d=$(mktemp -d); TMP_DIRS+=("$d"); printf '%s' "$d"; }
 # 状态
 # ---------------------------------------------------------------------------
 load_env() {
-  DOMAIN="" UUID="" WS_PATH="" CDN="no" V2FLY_TAG="latest" CADDY_TAG="2"
+  DOMAIN="" UUID="" WS_PATH="" CDN="no" FRONT="caddy" V2FLY_TAG="latest" CADDY_TAG="2"
   if [[ -f $ENV_FILE ]]; then
     # shellcheck disable=SC1090
     source "$ENV_FILE"
   fi
   : "${V2FLY_TAG:=latest}" "${CADDY_TAG:=2}"
+  # 旧版 .env 没有 FRONT，等价于 caddy 模式
+  [[ $FRONT == nginx ]] || FRONT=caddy
 }
 
 save_env() {
@@ -96,13 +103,14 @@ DOMAIN=$DOMAIN
 UUID=$UUID
 WS_PATH=$WS_PATH
 CDN=$CDN
+FRONT=$FRONT
 V2FLY_TAG=$V2FLY_TAG
 CADDY_TAG=$CADDY_TAG
 EOF
   chmod 600 "$ENV_FILE"
 }
 
-stack_running() { [[ -n "$(docker ps -q --filter name='^caddy$' 2>/dev/null)" ]]; }
+container_running() { [[ -n "$(docker ps -q --filter "name=^$1\$" 2>/dev/null)" ]]; }
 
 # ---------------------------------------------------------------------------
 # 环境准备
@@ -191,16 +199,23 @@ check_ipv6() {
   ylw "  建议在 DNS 里删掉这条 AAAA 记录，否则证书申请或客户端连接可能失败"
 }
 
-check_domain() {
-  step "检查域名 $DOMAIN 是否指向本机"
-  local ip resolved token dir got
-  ip=$(public_ip)
+show_dns() {
+  local resolved
+  PUBLIC_IP=$(public_ip)
   resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)
-  echo "本机公网 IP:   $ip"
+  echo "本机公网 IP:   $PUBLIC_IP"
   echo "域名当前解析: ${resolved:-（解析失败）}"
   check_ipv6
+}
 
-  port_in_use 80 && die "80 端口被占用，无法检查。先查明占用程序：ss -tlnp | grep ':80 '"
+check_domain() {
+  step "检查域名 $DOMAIN 是否指向本机"
+  local ip token dir got
+  show_dns
+  ip=$PUBLIC_IP
+
+  port_in_use 80 && die "80 端口被占用，无法检查。先查明占用程序：ss -tlnp | grep ':80 '
+  如果占用的是宝塔面板或其他 Nginx，请重新运行安装，前端模式选「已有 Nginx」"
 
   token=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
   dir=$(mktmp)
@@ -256,6 +271,24 @@ prompt_config() {
   done
   if confirm "是否通过 Cloudflare CDN 转发？" "$([[ $CDN == yes ]] && echo y || echo n)"; then CDN=yes; else CDN=no; fi
 
+  # 前端模式。首次安装时如果 443 已经被别的程序占着（宝塔面板之类），
+  # 默认就选 nginx，免得用户选了 caddy 再撞到端口冲突
+  local def=$FRONT
+  if [[ ! -f $ENV_FILE ]] && port_in_use 443 && ! container_running caddy; then
+    ylw "检测到 443 端口已被其他程序占用（宝塔面板 / Nginx？），默认选择「已有 Nginx」模式"
+    def=nginx
+  fi
+  echo "HTTPS 由谁负责："
+  echo "  1) 脚本自带 Caddy，自动申请证书（需要 80、443 端口空闲）"
+  echo "  2) 已有 Nginx（宝塔面板等）：只跑 V2Ray，证书和 443 交给 Nginx，需要你加一段反代"
+  while :; do
+    case "$(ask "请选择" "$([[ $def == nginx ]] && echo 2 || echo 1)")" in
+      1) FRONT=caddy; break ;;
+      2) FRONT=nginx; break ;;
+      *) red "请输入 1 或 2" ;;
+    esac
+  done
+
   DOMAIN_CHANGED=no
   [[ "$d" != "$DOMAIN" ]] && DOMAIN_CHANGED=yes
   DOMAIN=$d UUID=${u,,} WS_PATH=$p
@@ -265,14 +298,24 @@ prompt_config() {
   echo "  UUID:  $UUID"
   echo "  路径:  $WS_PATH"
   echo "  CDN:   $CDN"
-  echo "  镜像:  v2fly/v2fly-core:$V2FLY_TAG , caddy:$CADDY_TAG"
+  if [[ $FRONT == nginx ]]; then
+    echo "  前端:  已有 Nginx（宝塔），V2Ray 监听 127.0.0.1:2333"
+    echo "  镜像:  v2fly/v2fly-core:$V2FLY_TAG"
+  else
+    echo "  前端:  Caddy 自动证书"
+    echo "  镜像:  v2fly/v2fly-core:$V2FLY_TAG , caddy:$CADDY_TAG"
+  fi
   confirm "确认以上配置？" y || exit 1
 }
 
+# compose.yaml 按模式拼装：V2Ray 服务和它的配置两种模式都有；Caddy 服务、
+# Caddyfile、证书卷只在 caddy 模式写入。nginx 模式下 V2Ray 的 2333 端口发布到
+# 127.0.0.1，由宿主机上的 Nginx 反代，外网直接碰不到
 write_compose() {
   mkdir -p "$STACK_DIR"
-  cat > "$COMPOSE_FILE" <<'EOF'
-# 由 v2ray.sh 生成。域名、UUID、路径、镜像版本读取同目录的 .env
+  {
+    cat <<'EOF'
+# 由 v2ray.sh 生成。域名、UUID、路径、前端模式、镜像版本读取同目录的 .env
 name: v2ray
 
 services:
@@ -284,6 +327,14 @@ services:
     configs:
       - source: v2ray_config
         target: /etc/v2ray/config.json
+EOF
+    if [[ $FRONT == nginx ]]; then
+      cat <<'EOF'
+    ports:
+      - "127.0.0.1:2333:2333"
+EOF
+    else
+      cat <<'EOF'
 
   caddy:
     image: caddy:${CADDY_TAG}
@@ -300,6 +351,9 @@ services:
       - caddy_config:/config
     depends_on:
       - v2ray
+EOF
+    fi
+    cat <<'EOF'
 
 configs:
   v2ray_config:
@@ -315,6 +369,9 @@ configs:
         }],
         "outbounds": [{ "protocol": "freedom", "settings": {} }]
       }
+EOF
+    if [[ $FRONT == caddy ]]; then
+      cat <<'EOF'
   caddyfile:
     content: |
       ${DOMAIN} {
@@ -333,7 +390,34 @@ volumes:
   caddy_config:
     name: caddy_config
 EOF
+    fi
+  } > "$COMPOSE_FILE"
   compose config -q || die "compose.yaml 校验失败"
+}
+
+# nginx 模式下用户要在宝塔 / Nginx 里做的事。安装时打印，自检失败时也打印
+nginx_hint() {
+  step "宝塔 / Nginx 侧需要的配置"
+  echo "1) 在宝塔里为 $DOMAIN 添加站点（纯静态即可），申请 SSL 证书并部署"
+  echo "2) 打开该站点的「配置文件」，在 443 的 server 块里加入下面这段，保存后重载 Nginx："
+  cat <<EOF
+
+    location $WS_PATH {
+        proxy_pass http://127.0.0.1:2333;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_read_timeout 300s;
+    }
+
+EOF
+  echo "   不要用面板的「反向代理」功能整站反代，那会把根路径也转给 V2Ray；只加上面这个 location"
+  echo "3) 证书续期由宝塔负责；路径或域名改了要同步改这段配置"
+  if [[ $CDN == yes ]]; then
+    echo "4) Cloudflare 侧：云朵橙色、SSL/TLS 选「完全（严格）」、WebSockets 开启"
+  fi
 }
 
 vmess_link() {
@@ -352,6 +436,7 @@ vmess_link() {
 # RFC 里的示例值（解码为 the sample nonce，正好 16 字节）。
 # 不能用管道接 grep：握手成功后 curl 会一直等着读隧道数据，直到 --max-time
 # 超时并以 28 退出，而脚本开了 pipefail，管道整体就成了失败——越成功越判失败。
+# 无论哪种模式，本机 443 上都有反代（Caddy 或 Nginx），所以统一打 127.0.0.1:443
 ws_ok() {
   local code
   code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 5 \
@@ -362,12 +447,32 @@ ws_ok() {
   [[ ${code//[[:space:]]/} == 101 ]]
 }
 
+# nginx 模式专用：绕过 Nginx 直接打 V2Ray 的 2333，把「V2Ray 没起来」和
+# 「Nginx 反代 / 证书没配好」区分开，否则排查时不知道该看哪边
+v2ray_ok() {
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 5 \
+    -H "Host: $DOMAIN" -H "Connection: Upgrade" -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+    "http://127.0.0.1:2333$WS_PATH" 2>/dev/null) || true
+  [[ ${code//[[:space:]]/} == 101 ]]
+}
+
 # 二、真实连接：启动一个临时 V2Ray 客户端，用当前 UUID 走一遍代理访问外网
 #    能通过说明 UUID、路径、TLS 全部正确，而不只是端口通
+#    caddy 模式：放进 Caddy 所在的 Docker 网络，直接连容器名 caddy
+#    nginx 模式：Nginx 在宿主机上，用 host-gateway 让容器能连到宿主机的 443
 e2e_ok() {
-  local net dir hostport code
-  net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' caddy 2>/dev/null | awk '{print $1}')
-  [[ -n $net ]] || return 1
+  local net dir hostport code server run_opts=()
+  if [[ $FRONT == nginx ]]; then
+    server=host.docker.internal
+    run_opts=(--add-host "host.docker.internal:host-gateway")
+  else
+    net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' caddy 2>/dev/null | awk '{print $1}')
+    [[ -n $net ]] || return 1
+    server=caddy
+    run_opts=(--network "$net")
+  fi
   dir=$(mktmp); chmod 755 "$dir"
   cat > "$dir/config.json" <<EOF
 {
@@ -375,7 +480,7 @@ e2e_ok() {
   "inbounds": [{ "listen": "0.0.0.0", "port": 10808, "protocol": "socks", "settings": { "udp": false } }],
   "outbounds": [{
     "protocol": "vmess",
-    "settings": { "vnext": [{ "address": "caddy", "port": 443,
+    "settings": { "vnext": [{ "address": "$server", "port": 443,
       "users": [{ "id": "$UUID", "alterId": 0, "security": "auto" }] }] },
     "streamSettings": {
       "network": "ws",
@@ -388,7 +493,7 @@ e2e_ok() {
 EOF
   chmod 644 "$dir/config.json"
   docker rm -f v2ray-e2e >/dev/null 2>&1 || true
-  docker run -d --name v2ray-e2e --network "$net" -p 127.0.0.1::10808 \
+  docker run -d --name v2ray-e2e "${run_opts[@]}" -p 127.0.0.1::10808 \
     -v "$dir/config.json:/etc/v2ray/config.json:ro" \
     "v2fly/v2fly-core:$V2FLY_TAG" run -c /etc/v2ray/config.json >/dev/null 2>&1 || return 1
   sleep 3
@@ -421,20 +526,50 @@ cdn_hint() {
   echo "        3) 购买 Advanced Certificate Manager 开启 Total TLS"
 }
 
-wait_ready() {
-  step "等待证书申请和服务启动（最多 3 分钟）"
-  local ok=no
-  for _ in $(seq 1 36); do
-    if ws_ok; then ok=yes; break; fi
+# 等 fn 返回成功，最多 n 次，每次间隔 5 秒
+wait_for() {
+  local fn=$1 n=$2 i
+  for ((i = 0; i < n; i++)); do
+    if "$fn"; then echo; return 0; fi
     printf '.'; sleep 5
   done
   echo
-  if [[ $ok != yes ]]; then
+  return 1
+}
+
+wait_caddy() {
+  step "等待证书申请和服务启动（最多 3 分钟）"
+  if ! wait_for ws_ok 36; then
     red "✗ 3 分钟内没有就绪，Caddy 最近的日志："
     docker logs --tail 20 caddy 2>&1 | grep -iE 'error|obtain|challenge' || docker logs --tail 20 caddy
     return 1
   fi
   grn "✓ HTTPS 证书有效，WebSocket 握手成功"
+}
+
+wait_nginx() {
+  step "等待 V2Ray 启动"
+  if ! wait_for v2ray_ok 6; then
+    red "✗ V2Ray 在 127.0.0.1:2333 上没有响应，最近的日志："
+    docker logs --tail 20 v2ray 2>&1 | tail -20
+    return 1
+  fi
+  grn "✓ V2Ray 已在 127.0.0.1:2333 就绪"
+
+  step "检查 Nginx 反代和证书（经本机 443）"
+  port_in_use 443 || ylw "⚠ 443 端口上没有程序在监听，宝塔站点是不是还没建？"
+  if ! wait_for ws_ok 6; then
+    red "✗ 经 443 握手失败。V2Ray 本身是好的，问题在 Nginx 这一跳："
+    echo "  1) 站点证书是否已申请并部署（curl -vI https://$DOMAIN 看证书）"
+    echo "  2) location $WS_PATH 是否已加进 443 的 server 块并重载（nginx -t && nginx -s reload）"
+    echo "  3) Upgrade / Connection 头是否带上（少了会返回 200 或 400 而不是 101）"
+    return 1
+  fi
+  grn "✓ 证书有效，Nginx → V2Ray 握手成功"
+}
+
+wait_ready() {
+  if [[ $FRONT == nginx ]]; then wait_nginx || return 1; else wait_caddy || return 1; fi
 
   step "真实连接测试（用当前 UUID 走一遍代理）"
   if e2e_ok; then
@@ -507,13 +642,23 @@ cmd_install() {
   install_docker
   open_ufw
 
-  if stack_running && [[ $DOMAIN_CHANGED == yes ]]; then
-    ylw "域名有变化，先停止 Caddy 以便检查新域名（脚本中途退出会自动恢复）"
-    compose stop caddy >/dev/null
-    CADDY_STOPPED=yes
-  fi
-  if ! stack_running; then
-    check_domain
+  if [[ $FRONT == nginx ]]; then
+    # 80/443 在 Nginx 手里，起不了临时网页服务，域名只能打印解析结果供人眼核对；
+    # DNS 是否真的正确，由宝塔申请证书那一步来验证
+    step "域名解析（nginx 模式不做 80 端口检查，DNS 由宝塔申请证书时验证）"
+    show_dns
+  else
+    if container_running caddy && [[ $DOMAIN_CHANGED == yes ]]; then
+      ylw "域名有变化，先停止 Caddy 以便检查新域名（脚本中途退出会自动恢复）"
+      compose stop caddy >/dev/null
+      CADDY_STOPPED=yes
+    fi
+    if ! container_running caddy; then
+      # 从 nginx 模式切回来、或者机器上本来就有别的 web 服务时，443 也可能被占着，
+      # check_domain 只查 80，这里把 443 一起拦下，免得 compose up 才报端口冲突
+      port_in_use 443 && die "443 端口被占用（宝塔面板 / Nginx？）。要么停掉占用程序，要么前端模式选「已有 Nginx」"
+      check_domain
+    fi
   fi
 
   step "写入配置并启动"
@@ -521,9 +666,21 @@ cmd_install() {
   write_compose
   compose pull -q
   # 配置内嵌在 compose.yaml 里，只改内容时 Compose 不会重建容器，
-  # 会导致新 UUID / 路径不生效，所以这里强制重建
+  # 会导致新 UUID / 路径不生效，所以这里强制重建。--remove-orphans 顺带处理
+  # 模式切换：从 caddy 切到 nginx 时 compose.yaml 里没了 caddy 服务，旧容器会被删掉
   compose up -d --force-recreate --remove-orphans
   CADDY_STOPPED=no
+
+  if [[ $FRONT == nginx ]]; then
+    nginx_hint
+    if ! confirm "宝塔 / Nginx 侧已经配置好，现在开始自检？" y; then
+      cmd_show
+      echo
+      ylw "配置好 Nginx 反代后，运行本脚本选「查看运行状态」即可自检。"
+      grn "安装完成。以后重新运行本脚本即可更新、查看状态或修改配置。"
+      return 0
+    fi
+  fi
 
   # 自检没过也要把配置打出来：容器此时已经在跑，链接可能本来就是能用的，
   # 直接 die 掉等于让人白装一场
@@ -537,7 +694,7 @@ cmd_install() {
 
   cmd_show
   echo
-  if [[ $CDN == yes ]]; then
+  if [[ $CDN == yes && $FRONT == caddy ]]; then
     ylw "Cloudflare 设置：云朵改为橙色（已代理）；SSL/TLS 模式选「完全（严格）」；网络里 WebSockets 保持开启；不要开启「始终使用 HTTPS」"
   fi
   grn "安装完成。以后重新运行本脚本即可更新、查看状态或修改配置。"
@@ -583,13 +740,23 @@ cmd_status() {
   compose ps --format 'table {{.Name}}\t{{.Status}}'
   step "版本"
   docker exec v2ray v2ray version 2>/dev/null | head -1 || true
-  docker exec caddy caddy version 2>/dev/null | head -1 || true
-  echo "配置中的镜像标签: v2fly/v2fly-core:$V2FLY_TAG , caddy:$CADDY_TAG"
-  step "证书"
+  if [[ $FRONT == nginx ]]; then
+    echo "前端: 已有 Nginx（宝塔），V2Ray 监听 127.0.0.1:2333"
+    echo "配置中的镜像标签: v2fly/v2fly-core:$V2FLY_TAG"
+  else
+    docker exec caddy caddy version 2>/dev/null | head -1 || true
+    echo "配置中的镜像标签: v2fly/v2fly-core:$V2FLY_TAG , caddy:$CADDY_TAG"
+  fi
+  step "证书$([[ $FRONT == nginx ]] && echo '（由宝塔 / Nginx 管理）')"
   echo | openssl s_client -connect 127.0.0.1:443 -servername "$DOMAIN" 2>/dev/null \
     | openssl x509 -noout -issuer -enddate 2>/dev/null || red "读取证书失败"
   step "链路自检"
-  if ws_ok; then grn "✓ 证书和 WebSocket 正常"; else red "✗ WebSocket 握手失败: docker logs --tail 50 caddy"; fi
+  if [[ $FRONT == nginx ]]; then
+    if v2ray_ok; then grn "✓ V2Ray 在 127.0.0.1:2333 正常"; else red "✗ V2Ray 无响应: docker logs --tail 50 v2ray"; fi
+    if ws_ok; then grn "✓ 证书和 Nginx 反代正常"; else red "✗ 经 443 握手失败: 检查站点证书和 location $WS_PATH 反代（nginx -t）"; fi
+  else
+    if ws_ok; then grn "✓ 证书和 WebSocket 正常"; else red "✗ WebSocket 握手失败: docker logs --tail 50 caddy"; fi
+  fi
   if e2e_ok; then grn "✓ 代理连通"; else red "✗ 代理连不通: docker logs --tail 50 v2ray"; fi
   if [[ $CDN == yes ]]; then
     if cdn_ok; then grn "✓ 经 Cloudflare 边缘访问正常"; else cdn_hint; fi
@@ -614,7 +781,11 @@ menu() {
   load_env
   echo
   echo "======== V2Ray 管理 ========"
-  if [[ -n $DOMAIN ]]; then echo " 当前: $DOMAIN  路径 $WS_PATH  CDN $CDN"; else echo " 当前: 未安装"; fi
+  if [[ -n $DOMAIN ]]; then
+    echo " 当前: $DOMAIN  路径 $WS_PATH  CDN $CDN  前端 $([[ $FRONT == nginx ]] && echo '已有 Nginx' || echo Caddy)"
+  else
+    echo " 当前: 未安装"
+  fi
   echo " 1) 安装 / 修改配置"
   echo " 2) 更新到最新版"
   echo " 3) 查看运行状态"
